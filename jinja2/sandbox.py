@@ -13,6 +13,7 @@
     :license: BSD.
 """
 import operator
+from twisted.internet import defer
 from jinja2.runtime import Undefined
 from jinja2.environment import Environment
 from jinja2.exceptions import SecurityError
@@ -255,7 +256,7 @@ class SandboxedEnvironment(Environment):
         # the double prefixes are to avoid double keyword argument
         # errors when proxying the call.
         if not __self.is_safe_callable(__obj):
-            raise SecurityError('%r is not safely callable' % (__obj,))
+            return defer.fail(SecurityError('%r is not safely callable' % (__obj,)))
         return __context.call(__obj, *args, **kwargs)
 
 

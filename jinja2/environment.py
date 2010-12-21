@@ -10,6 +10,7 @@
 """
 import os
 import sys
+from twisted.internet import defer
 from jinja2 import nodes
 from jinja2.defaults import *
 from jinja2.lexer import get_lexer, TokenStream
@@ -20,7 +21,7 @@ from jinja2.runtime import Undefined, new_context
 from jinja2.exceptions import TemplateSyntaxError, TemplateNotFound, \
      TemplatesNotFound
 from jinja2.utils import import_string, LRUCache, Markup, missing, \
-     concat, consume, internalcode, _encode_filename
+     concat, internalcode, _encode_filename
 
 
 # for direct template usage we have up to ten living environments
@@ -679,18 +680,20 @@ class Environment(object):
         return template
 
     @internalcode
+    @defer.inlineCallbacks
     def _load_template(self, name, globals):
+        if 0: yield None
         if self.loader is None:
             raise TypeError('no loader for this environment specified')
         if self.cache is not None:
             template = self.cache.get(name)
             if template is not None and (not self.auto_reload or \
                                          template.is_up_to_date):
-                return template
+                defer.returnValue(template)
         template = self.loader.load(self, name, globals)
         if self.cache is not None:
             self.cache[name] = template
-        return template
+        defer.returnValue(template)
 
     @internalcode
     def get_template(self, name, parent=None, globals=None):
@@ -710,12 +713,13 @@ class Environment(object):
            function unchanged.
         """
         if isinstance(name, Template):
-            return name
+            return defer.succeed(name)
         if parent is not None:
             name = self.join_path(name, parent)
         return self._load_template(name, self.make_globals(globals))
 
     @internalcode
+    @defer.inlineCallbacks
     def select_template(self, names, parent=None, globals=None):
         """Works like :meth:`get_template` but tries a number of templates
         before it fails.  If it cannot find any of the templates, it will
@@ -733,13 +737,14 @@ class Environment(object):
         globals = self.make_globals(globals)
         for name in names:
             if isinstance(name, Template):
-                return name
+                defer.returnValue(name)
             if parent is not None:
                 name = self.join_path(name, parent)
             try:
-                return self._load_template(name, globals)
+                template = yield self._load_template(name, globals)
             except TemplateNotFound:
-                pass
+                continue
+            defer.returnValue(template)
         raise TemplatesNotFound(names)
 
     @internalcode
@@ -754,7 +759,7 @@ class Environment(object):
         if isinstance(template_name_or_list, basestring):
             return self.get_template(template_name_or_list, parent, globals)
         elif isinstance(template_name_or_list, Template):
-            return template_name_or_list
+            return defer.succeed(template_name_or_list)
         return self.select_template(template_name_or_list, parent, globals)
 
     def from_string(self, source, globals=None, template_class=None):
@@ -873,6 +878,7 @@ class Template(object):
 
         return t
 
+    @defer.inlineCallbacks
     def render(self, *args, **kwargs):
         """This method accepts the same arguments as the `dict` constructor:
         A dict, a dict subclass or some keyword arguments.  If no arguments
@@ -885,34 +891,10 @@ class Template(object):
         """
         vars = dict(*args, **kwargs)
         try:
-            return concat(self.root_render_func(self.new_context(vars)))
+            rv = yield self.root_render_func(self.new_context(vars))
         except:
-            exc_info = sys.exc_info()
-        return self.environment.handle_exception(exc_info, True)
-
-    def stream(self, *args, **kwargs):
-        """Works exactly like :meth:`generate` but returns a
-        :class:`TemplateStream`.
-        """
-        return TemplateStream(self.generate(*args, **kwargs))
-
-    def generate(self, *args, **kwargs):
-        """For very large templates it can be useful to not render the whole
-        template at once but evaluate each statement after another and yield
-        piece for piece.  This method basically does exactly that and returns
-        a generator that yields one item after another as unicode strings.
-
-        It accepts the same arguments as :meth:`render`.
-        """
-        vars = dict(*args, **kwargs)
-        try:
-            for event in self.root_render_func(self.new_context(vars)):
-                yield event
-        except:
-            exc_info = sys.exc_info()
-        else:
-            return
-        yield self.environment.handle_exception(exc_info, True)
+            defer.returnValue(self.environment.handle_exception(sys.exc_info(), True))
+        defer.returnValue(rv)
 
     def new_context(self, vars=None, shared=False, locals=None):
         """Create a new :class:`Context` for this template.  The vars
@@ -932,7 +914,10 @@ class Template(object):
         a dict which is then used as context.  The arguments are the same
         as for the :meth:`new_context` method.
         """
-        return TemplateModule(self, self.new_context(vars, shared, locals))
+        context = self.new_context(vars, shared, locals)
+        d = self.root_render_func(context)
+        d.addCallback(lambda res: TemplateModule(self.name, res, context))
+        return d
 
     @property
     def module(self):
@@ -946,10 +931,12 @@ class Template(object):
         >>> t.module.foo()
         u'42'
         """
-        if self._module is not None:
-            return self._module
-        self._module = rv = self.make_module()
-        return rv
+        if self._module is None:
+            self._module = self.make_module()
+        d = defer.Deferred()
+        self._module.addCallbacks(lambda res: d.callback(res) or res,
+                                  lambda err: d.errback(err)  or err)
+        return d
 
     def get_corresponding_lineno(self, lineno):
         """Return the source line number of a line number in the
@@ -987,13 +974,13 @@ class TemplateModule(object):
     converting it into an unicode- or bytestrings renders the contents.
     """
 
-    def __init__(self, template, context):
-        self._body_stream = list(template.root_render_func(context))
+    def __init__(self, name, body, context):
+        self._body = body
         self.__dict__.update(context.get_exported())
-        self.__name__ = template.name
+        self.__name__ = name
 
     def __html__(self):
-        return Markup(concat(self._body_stream))
+        return Markup(self._body)
 
     def __str__(self):
         return unicode(self).encode('utf-8')
@@ -1003,7 +990,7 @@ class TemplateModule(object):
     # remove nodes from it, we leave the above __str__ around and let
     # it override at runtime.
     def __unicode__(self):
-        return concat(self._body_stream)
+        return self._body
 
     def __repr__(self):
         if self.__name__ is None:
@@ -1025,92 +1012,11 @@ class TemplateExpression(object):
 
     def __call__(self, *args, **kwargs):
         context = self._template.new_context(dict(*args, **kwargs))
-        consume(self._template.root_render_func(context))
-        rv = context.vars['result']
-        if self._undefined_to_none and isinstance(rv, Undefined):
-            rv = None
-        return rv
-
-
-class TemplateStream(object):
-    """A template stream works pretty much like an ordinary python generator
-    but it can buffer multiple items to reduce the number of total iterations.
-    Per default the output is unbuffered which means that for every unbuffered
-    instruction in the template one unicode string is yielded.
-
-    If buffering is enabled with a buffer size of 5, five items are combined
-    into a new unicode string.  This is mainly useful if you are streaming
-    big templates to a client via WSGI which flushes after each iteration.
-    """
-
-    def __init__(self, gen):
-        self._gen = gen
-        self.disable_buffering()
-
-    def dump(self, fp, encoding=None, errors='strict'):
-        """Dump the complete stream into a file or file-like object.
-        Per default unicode strings are written, if you want to encode
-        before writing specifiy an `encoding`.
-
-        Example usage::
-
-            Template('Hello {{ name }}!').stream(name='foo').dump('hello.html')
-        """
-        close = False
-        if isinstance(fp, basestring):
-            fp = file(fp, 'w')
-            close = True
-        try:
-            if encoding is not None:
-                iterable = (x.encode(encoding, errors) for x in self)
-            else:
-                iterable = self
-            if hasattr(fp, 'writelines'):
-                fp.writelines(iterable)
-            else:
-                for item in iterable:
-                    fp.write(item)
-        finally:
-            if close:
-                fp.close()
-
-    def disable_buffering(self):
-        """Disable the output buffering."""
-        self._next = self._gen.next
-        self.buffered = False
-
-    def enable_buffering(self, size=5):
-        """Enable buffering.  Buffer `size` items before yielding them."""
-        if size <= 1:
-            raise ValueError('buffer size too small')
-
-        def generator(next):
-            buf = []
-            c_size = 0
-            push = buf.append
-
-            while 1:
-                try:
-                    while c_size < size:
-                        c = next()
-                        push(c)
-                        if c:
-                            c_size += 1
-                except StopIteration:
-                    if not c_size:
-                        return
-                yield concat(buf)
-                del buf[:]
-                c_size = 0
-
-        self.buffered = True
-        self._next = generator(self._gen.next).next
-
-    def __iter__(self):
-        return self
-
-    def next(self):
-        return self._next()
+        d = self._template.root_render_func(context)
+        d.addCallback(lambda res: context.vars['result'])
+        if self._undefined_to_none:
+            d.addCallback(lambda res: None if isinstance(res, Undefined) else res)
+        return d
 
 
 # hook in default template class.  if anyone reads this comment: ignore that

@@ -10,6 +10,7 @@
 """
 import sys
 from itertools import chain, imap
+from twisted.internet import defer
 from jinja2.nodes import EvalContext, _context_function_types
 from jinja2.utils import Markup, partial, soft_unicode, escape, missing, \
      concat, internalcode, next, object_type_repr
@@ -179,12 +180,10 @@ class Context(object):
                 args = (__self.eval_ctx,) + args
             elif getattr(__obj, 'environmentfunction', 0):
                 args = (__self.environment,) + args
-        try:
-            return __obj(*args, **kwargs)
-        except StopIteration:
-            return __self.environment.undefined('value was undefined because '
-                                                'a callable raised a '
-                                                'StopIteration exception')
+
+        d = defer.maybeDeferred(__obj, *args, **kwargs)
+        d.addErrback(lambda err: __self.environment.undefined('value was undefined because a callable raised a StopIteration exception') if err.check(StopIteration) else err)
+        return d
 
     def derived(self, locals=None):
         """Internal helper function to create a derived context."""
