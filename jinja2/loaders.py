@@ -17,6 +17,8 @@ try:
     from hashlib import sha1
 except ImportError:
     from sha import new as sha1
+from twisted.internet import defer
+from twisted.internet.threads import deferToThread
 from jinja2.exceptions import TemplateNotFound
 from jinja2.utils import LRUCache, open_if_exists, internalcode
 
@@ -34,6 +36,19 @@ def split_template_path(template):
         elif piece and piece != '.':
             pieces.append(piece)
     return pieces
+
+def make_file_uptodate(filename, mtime):
+    """Make a function that returns a deferred boolean value indicating
+    whether a file with the given name exists and don't has been modified yet.
+    """
+    def uptodate():
+        try:
+            return path.getmtime(filename) == mtime
+        except OSError:
+            return False
+    # getmtime() will block while reading the filesystem. There is no non-blocking
+    # way in Python to retrieve file stats. So we have to run that code in a thread.
+    return (lambda: deferToThread(uptodate))
 
 
 class BaseLoader(object):
@@ -170,13 +185,7 @@ class FileSystemLoader(BaseLoader):
             finally:
                 f.close()
 
-            mtime = path.getmtime(filename)
-            def uptodate():
-                try:
-                    return path.getmtime(filename) == mtime
-                except OSError:
-                    return False
-            return contents, filename, uptodate
+            return contents, filename, make_file_uptodate(filename, path.getmtime(filename))
         raise TemplateNotFound(template)
 
     def list_templates(self):
@@ -226,15 +235,12 @@ class PackageLoader(BaseLoader):
         if not self.provider.has_resource(p):
             raise TemplateNotFound(template)
 
-        filename = uptodate = None
         if self.filesystem_bound:
             filename = self.provider.get_resource_filename(self.manager, p)
-            mtime = path.getmtime(filename)
-            def uptodate():
-                try:
-                    return path.getmtime(filename) == mtime
-                except OSError:
-                    return False
+            uptodate = make_file_uptodate(filename, path.getmtime(filename))
+        else:
+            filename = None
+            uptodate = None
 
         source = self.provider.get_resource_string(self.manager, p)
         return source.decode(self.encoding), filename, uptodate
@@ -275,7 +281,7 @@ class DictLoader(BaseLoader):
     def get_source(self, environment, template):
         if template in self.mapping:
             source = self.mapping[template]
-            return source, None, lambda: source != self.mapping.get(template)
+            return source, None, lambda: defer.success(source != self.mapping.get(template))
         raise TemplateNotFound(template)
 
     def list_templates(self):

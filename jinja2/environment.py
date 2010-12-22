@@ -682,13 +682,11 @@ class Environment(object):
     @internalcode
     @defer.inlineCallbacks
     def _load_template(self, name, globals):
-        if 0: yield None
         if self.loader is None:
             raise TypeError('no loader for this environment specified')
         if self.cache is not None:
             template = self.cache.get(name)
-            if template is not None and (not self.auto_reload or \
-                                         template.is_up_to_date):
+            if template is not None and (not self.auto_reload or (yield template.is_up_to_date)):
                 defer.returnValue(template)
         template = self.loader.load(self, name, globals)
         if self.cache is not None:
@@ -951,7 +949,7 @@ class Template(object):
     def is_up_to_date(self):
         """If this variable is `False` there is a newer version available."""
         if self._uptodate is None:
-            return True
+            return defer.succeed(True)
         return self._uptodate()
 
     @property
