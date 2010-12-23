@@ -17,6 +17,8 @@ except ImportError:
     from dummy_thread import allocate_lock
 from collections import deque
 from itertools import imap
+from functools import wraps
+from twisted.internet.threads import deferToThread
 
 
 _word_split_re = re.compile(r'(\s+)')
@@ -154,6 +156,13 @@ def internalcode(f):
     """Marks the function as internally used"""
     internal_code.add(f.func_code)
     return f
+
+
+def deferred_in_thread(f):
+    """This decorator can be used to make a function that needs to deal with
+    blocking IO for example, run in a thread and return the result as a Deferred.
+    """
+    return wraps(f)(lambda *args, **kwargs: deferToThread(f, *args, **kwargs))
 
 
 def is_undefined(obj):

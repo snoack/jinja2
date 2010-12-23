@@ -18,9 +18,8 @@ try:
 except ImportError:
     from sha import new as sha1
 from twisted.internet import defer
-from twisted.internet.threads import deferToThread
 from jinja2.exceptions import TemplateNotFound
-from jinja2.utils import LRUCache, open_if_exists, internalcode
+from jinja2.utils import LRUCache, open_if_exists, internalcode, concat, deferred_in_thread
 
 
 def split_template_path(template):
@@ -48,7 +47,7 @@ def make_file_uptodate(filename, mtime):
             return False
     # getmtime() will block while reading the filesystem. There is no non-blocking
     # way in Python to retrieve file stats. So we have to run that code in a thread.
-    return (lambda: deferToThread(uptodate))
+    return deferred_in_thread(uptodate)
 
 
 class BaseLoader(object):
@@ -103,17 +102,17 @@ class BaseLoader(object):
         the template will be reloaded.
         """
         if not self.has_source_access:
-            raise RuntimeError('%s cannot provide access to the source' %
-                               self.__class__.__name__)
-        raise TemplateNotFound(template)
+            return defer.fail(RuntimeError('%s cannot provide access to the source' % self.__class__.__name__))
+        raise defer.fail(TemplateNotFound(template))
 
     def list_templates(self):
         """Iterates over all templates.  If the loader does not support that
         it should raise a :exc:`TypeError` which is the default behavior.
         """
-        raise TypeError('this loader cannot iterate over all templates')
+        return defer.fail(TypeError('this loader cannot iterate over all templates'))
 
     @internalcode
+    @defer.inlineCallbacks
     def load(self, environment, name, globals=None):
         """Loads a template.  This method looks up the template in the cache
         or loads one by calling :meth:`get_source`.  Subclasses should not
@@ -127,7 +126,7 @@ class BaseLoader(object):
 
         # first we try to get the source for this template together
         # with the filename and the uptodate function.
-        source, filename, uptodate = self.get_source(environment, name)
+        source, filename, uptodate = yield self.get_source(environment, name)
 
         # try to load the code from the bytecode cache if there is a
         # bytecode cache configured.
@@ -148,8 +147,8 @@ class BaseLoader(object):
             bucket.code = code
             bcc.set_bucket(bucket)
 
-        return environment.template_class.from_code(environment, code,
-                                                    globals, uptodate)
+        defer.returnValue(environment.template_class.from_code(environment, code,
+                                                               globals, uptodate))
 
 
 class FileSystemLoader(BaseLoader):
@@ -173,6 +172,7 @@ class FileSystemLoader(BaseLoader):
         self.searchpath = list(searchpath)
         self.encoding = encoding
 
+    @deferred_in_thread
     def get_source(self, environment, template):
         pieces = split_template_path(template)
         for searchpath in self.searchpath:
@@ -188,6 +188,7 @@ class FileSystemLoader(BaseLoader):
             return contents, filename, make_file_uptodate(filename, path.getmtime(filename))
         raise TemplateNotFound(template)
 
+    @deferred_in_thread
     def list_templates(self):
         found = set()
         for searchpath in self.searchpath:
@@ -229,6 +230,7 @@ class PackageLoader(BaseLoader):
         self.provider = provider
         self.package_path = package_path
 
+    @deferred_in_thread
     def get_source(self, environment, template):
         pieces = split_template_path(template)
         p = '/'.join((self.package_path,) + tuple(pieces))
@@ -245,6 +247,7 @@ class PackageLoader(BaseLoader):
         source = self.provider.get_resource_string(self.manager, p)
         return source.decode(self.encoding), filename, uptodate
 
+    @deferred_in_thread
     def list_templates(self):
         path = self.package_path
         if path[:2] == './':
@@ -281,11 +284,11 @@ class DictLoader(BaseLoader):
     def get_source(self, environment, template):
         if template in self.mapping:
             source = self.mapping[template]
-            return source, None, lambda: defer.success(source != self.mapping.get(template))
-        raise TemplateNotFound(template)
+            return defer.succeed((source, None, lambda: defer.succeed(source != self.mapping.get(template))))
+        return defer.fail(TemplateNotFound(template))
 
     def list_templates(self):
-        return sorted(self.mapping)
+        return defer.succeed(sorted(self.mapping))
 
 
 class FunctionLoader(BaseLoader):
@@ -309,13 +312,14 @@ class FunctionLoader(BaseLoader):
     def __init__(self, load_func):
         self.load_func = load_func
 
+    @defer.inlineCallbacks
     def get_source(self, environment, template):
-        rv = self.load_func(template)
+        rv = yield defer.maybeDeferred(self.load_func, template)
         if rv is None:
             raise TemplateNotFound(template)
         elif isinstance(rv, basestring):
-            return rv, None, None
-        return rv
+            defer.returnValue((rv, None, None))
+        defer.returnValue(rv)
 
 
 class PrefixLoader(BaseLoader):
@@ -342,20 +346,33 @@ class PrefixLoader(BaseLoader):
             prefix, name = template.split(self.delimiter, 1)
             loader = self.mapping[prefix]
         except (ValueError, KeyError):
-            raise TemplateNotFound(template)
-        try:
-            return loader.get_source(environment, name)
-        except TemplateNotFound:
+            return defer.fail(TemplateNotFound(template))
+
+        def errback(err):
+            if not isinstance(err, TemplateNotFound):
+                return err
             # re-raise the exception with the correct fileame here.
             # (the one that includes the prefix)
             raise TemplateNotFound(template)
 
+        return loader.get_source(environment, name).addErrback(errback)
+
     def list_templates(self):
-        result = []
+        templates = []
+        d = defer.Deferred()
+
+        def callback(res, prefix):
+            templates.append((prefix, res))
+
+            if not d.called and len(templates) == len(self.mapping):
+                d.callback([concat((p, self.delimiter, t)) for p, l in templates for t in l])
+
         for prefix, loader in self.mapping.iteritems():
-            for template in loader.list_templates():
-                result.append(prefix + self.delimiter + template)
-        return result
+            d2 = loader.list_templates()
+            d2.addCallback(callback, prefix)
+            d2.addErrback(lambda err: d.called or d.errback(err))
+
+        return d
 
 
 class ChoiceLoader(BaseLoader):
@@ -375,19 +392,34 @@ class ChoiceLoader(BaseLoader):
     def __init__(self, loaders):
         self.loaders = loaders
 
+    @defer.inlineCallbacks
     def get_source(self, environment, template):
         for loader in self.loaders:
             try:
-                return loader.get_source(environment, template)
+                rv = yield loader.get_source(environment, template)
             except TemplateNotFound:
-                pass
+                continue
+            defer.returnValue(rv)
         raise TemplateNotFound(template)
 
     def list_templates(self):
-        found = set()
+        templates = []
+        d = defer.Deferred()
+
+        def callback(res):
+            templates.append(res)
+
+            if not d.called and len(templates) == len(self.loaders):
+                res = [t for l in templates for t in l]
+                res.sort()
+                d.callback(res)
+
         for loader in self.loaders:
-            found.update(loader.list_templates())
-        return sorted(found)
+            d2 = loader.list_templates()
+            d2.addCallback(callback)
+            d2.addErrback(lambda err: d.called or d.errback(err))
+
+        return d
 
 
 class _TemplateModule(ModuleType):
@@ -445,11 +477,12 @@ class ModuleLoader(BaseLoader):
             try:
                 mod = __import__(module, None, None, ['root'])
             except ImportError:
-                raise TemplateNotFound(name)
+                return defer.fail(TemplateNotFound(name))
+            except Exception, e:
+                return defer.fail(e)
 
             # remove the entry from sys.modules, we only want the attribute
             # on the module object we have stored on the loader.
             sys.modules.pop(module, None)
 
-        return environment.template_class.from_module_dict(
-            environment, mod.__dict__, globals)
+        return defer.succeed(environment.template_class.from_module_dict(environment, mod.__dict__, globals))

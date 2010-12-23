@@ -11,6 +11,7 @@
 import os
 import sys
 from twisted.internet import defer
+from twisted.internet.threads import deferToThread
 from jinja2 import nodes
 from jinja2.defaults import *
 from jinja2.lexer import get_lexer, TokenStream
@@ -570,55 +571,94 @@ class Environment(object):
             py_header = imp.get_magic() + \
                 u'\xff\xff\xff\xff'.encode('iso-8859-15')
 
-        def write_file(filename, data, mode):
-            if zip:
-                info = ZipInfo(filename)
-                info.external_attr = 0755 << 16L
-                zip_file.writestr(info, data)
+        d = defer.Deferred()
+
+        def compile_and_store_templates(templates):
+            from Queue import Queue
+            queue = Queue()
+
+            if zip is not None:
+                def store_templates():
+                    from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED, ZIP_STORED
+                    zip_file = ZipFile(target, 'w', dict(deflated=ZIP_DEFLATED,
+                                                         stored=ZIP_STORED)[zip])
+                    try:
+                        log_function('Compiling into Zip archive "%s"' % target)
+
+                        while True:
+                            filename, data, mode = queue.get()
+                            if filename is None:
+                                break
+
+                            info = ZipInfo(filename)
+                            info.external_attr = 0755 << 16L
+                            zip_file.writestr(info, data)
+                    finally:
+                        zip_file.close()
+
+                    log_function('Finished compiling templates')
             else:
-                f = open(os.path.join(target, filename), mode)
-                try:
-                    f.write(data)
-                finally:
-                    f.close()
+                def store_templates():
+                    if not os.path.isdir(target):
+                        os.makedirs(target)
 
-        if zip is not None:
-            from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED, ZIP_STORED
-            zip_file = ZipFile(target, 'w', dict(deflated=ZIP_DEFLATED,
-                                                 stored=ZIP_STORED)[zip])
-            log_function('Compiling into Zip archive "%s"' % target)
-        else:
-            if not os.path.isdir(target):
-                os.makedirs(target)
-            log_function('Compiling into folder "%s"' % target)
+                    log_function('Compiling into folder "%s"' % target)
 
-        try:
-            for name in self.list_templates(extensions, filter_func):
-                source, filename, _ = self.loader.get_source(self, name)
+                    while True:
+                        filename, data, mode = queue.get()
+                        if filename is None:
+                            break
+
+                        f = open(os.path.join(target, filename), mode)
+                        try:
+                            f.write(data)
+                        finally:
+                            f.close()
+
+                    log_function('Finished compiling templates')
+
+            d3 = deferToThread(store_templates)
+            d3.addCallbacks(lambda res: d.called or d.callback(res),
+                            lambda err: d.called or d.errback(err))
+
+            def compile_template((source, filename, uptodate), name):
+                if d.called:
+                    return
+
+                templates.remove(name)
+
                 try:
                     code = self.compile(source, name, filename, True, True)
                 except TemplateSyntaxError, e:
                     if not ignore_errors:
                         raise
                     log_function('Could not compile "%s": %s' % (name, e))
-                    continue
+                    return
 
                 filename = ModuleLoader.get_module_filename(name)
 
                 if py_compile:
                     c = self._compile(code, _encode_filename(filename))
-                    write_file(filename + 'c', py_header +
-                               marshal.dumps(c), 'wb')
-                    log_function('Byte-compiled "%s" as %s' %
-                                 (name, filename + 'c'))
+                    queue.put((filename + 'c', py_header + marshal.dumps(c), 'wb'))
+                    log_function('Byte-compiled "%s" as %s' % (name, filename + 'c'))
                 else:
-                    write_file(filename, code, 'w')
+                    queue.put((filename, code, 'w'))
                     log_function('Compiled "%s" as %s' % (name, filename))
-        finally:
-            if zip:
-                zip_file.close()
 
-        log_function('Finished compiling templates')
+                if not templates:
+                    queue.put((None, None, None))
+
+            for name in templates:
+                d4 = self.loader.get_source(self, name)
+                d4.addCallback(compile_template, name)
+                d4.addErrback(lambda err: d.called or d.errback(err) or queue.put((None, None, None)))
+
+        d2 = self.list_templates(extensions, filter_func)
+        d2.addCallback(compile_and_store_templates)
+        d2.addErrback(lambda err: d.called or d.errback(err))
+
+        return d
+
 
     def list_templates(self, extensions=None, filter_func=None):
         """Returns a list of templates for this environment.  This requires
@@ -634,16 +674,19 @@ class Environment(object):
 
         If the loader does not support that, a :exc:`TypeError` is raised.
         """
-        x = self.loader.list_templates()
         if extensions is not None:
             if filter_func is not None:
                 raise TypeError('either extensions or filter_func '
                                 'can be passed, but not both')
             filter_func = lambda x: '.' in x and \
                                     x.rsplit('.', 1)[1] in extensions
+
+        d = self.loader.list_templates()
+
         if filter_func is not None:
-            x = filter(filter_func, x)
-        return x
+            d.addCallback(lambda res: filter(filter_func, res))
+
+        return d
 
     def handle_exception(self, exc_info=None, rendered=False, source_hint=None):
         """Exception handling helper.  This is used internally to either raise
@@ -688,7 +731,7 @@ class Environment(object):
             template = self.cache.get(name)
             if template is not None and (not self.auto_reload or (yield template.is_up_to_date)):
                 defer.returnValue(template)
-        template = self.loader.load(self, name, globals)
+        template = yield self.loader.load(self, name, globals)
         if self.cache is not None:
             self.cache[name] = template
         defer.returnValue(template)
