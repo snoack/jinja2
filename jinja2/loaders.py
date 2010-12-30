@@ -132,7 +132,7 @@ class BaseLoader(object):
         # bytecode cache configured.
         bcc = environment.bytecode_cache
         if bcc is not None:
-            bucket = bcc.get_bucket(environment, name, filename, source)
+            bucket = yield bcc.get_bucket(environment, name, filename, source)
             code = bucket.code
 
         # if we don't have code so far (not cached, no longer up to

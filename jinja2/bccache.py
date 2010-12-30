@@ -24,7 +24,8 @@ try:
     from hashlib import sha1
 except ImportError:
     from sha import new as sha1
-from jinja2.utils import open_if_exists
+from twisted.internet import defer
+from jinja2.utils import open_if_exists, deferred_in_thread
 
 
 bc_version = 1
@@ -139,6 +140,7 @@ class BytecodeCache(object):
         implemented to allow applications to clear the bytecode cache used
         by a particular environment.
         """
+        return defer.succeed(None)
 
     def get_cache_key(self, name, filename=None):
         """Returns the unique hash key for this template name."""
@@ -160,12 +162,13 @@ class BytecodeCache(object):
         key = self.get_cache_key(name, filename)
         checksum = self.get_source_checksum(source)
         bucket = Bucket(environment, key, checksum)
-        self.load_bytecode(bucket)
-        return bucket
+        d = defer.Deferred()
+        self.load_bytecode(bucket).addCallbacks(lambda res: d.callback(bucket), d.errback)
+        return d
 
     def set_bucket(self, bucket):
         """Put the bucket into the cache."""
-        self.dump_bytecode(bucket)
+        return self.dump_bytecode(bucket)
 
 
 class FileSystemBytecodeCache(BytecodeCache):
@@ -193,6 +196,7 @@ class FileSystemBytecodeCache(BytecodeCache):
     def _get_cache_filename(self, bucket):
         return path.join(self.directory, self.pattern % bucket.key)
 
+    @deferred_in_thread
     def load_bytecode(self, bucket):
         f = open_if_exists(self._get_cache_filename(bucket), 'rb')
         if f is not None:
@@ -201,6 +205,7 @@ class FileSystemBytecodeCache(BytecodeCache):
             finally:
                 f.close()
 
+    @deferred_in_thread
     def dump_bytecode(self, bucket):
         f = open(self._get_cache_filename(bucket), 'wb')
         try:
@@ -208,6 +213,7 @@ class FileSystemBytecodeCache(BytecodeCache):
         finally:
             f.close()
 
+    @deferred_in_thread
     def clear(self):
         # imported lazily here because google app-engine doesn't support
         # write access on the file system and the function does not exist
@@ -263,18 +269,18 @@ class MemcachedBytecodeCache(BytecodeCache):
     The clear method is a no-operation function.
     """
 
-    def __init__(self, client, prefix='jinja2/bytecode/', timeout=None):
-        self.client = client
+    def __init__(self, proto, prefix='jinja2/bytecode/', timeout=None):
+        self.proto = proto
         self.prefix = prefix
         self.timeout = timeout
 
     def load_bytecode(self, bucket):
-        code = self.client.get(self.prefix + bucket.key)
-        if code is not None:
-            bucket.bytecode_from_string(code)
+        d = self.proto.get(self.prefix + bucket.key)
+        d.addCallback(lambda res: res is None or bucket.bytecode_from_string(res))
+        return d
 
     def dump_bytecode(self, bucket):
-        args = (self.prefix + bucket.key, bucket.bytecode_to_string())
+        args = (self.prefix + bucket.key, bucket.bytecode_to_string(), 0)
         if self.timeout is not None:
             args += (self.timeout,)
-        self.client.set(*args)
+        return self.proto.set(*args)
