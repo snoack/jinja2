@@ -10,6 +10,7 @@
 """
 import os
 import sys
+from operator import setitem
 from twisted.internet import defer
 from twisted.internet.threads import deferToThread
 from jinja2 import nodes
@@ -724,17 +725,28 @@ class Environment(object):
 
     @internalcode
     @defer.inlineCallbacks
+    def _load_cached_template(self, name, globals, template):
+        if template is None or self.auto_reload and not (yield template.is_up_to_date):
+            template = yield self.loader.load(self, name, globals)
+        defer.returnValue(template)
+
+    @internalcode
     def _load_template(self, name, globals):
         if self.loader is None:
-            raise TypeError('no loader for this environment specified')
+            return defer.fail(TypeError('no loader for this environment specified'))
         if self.cache is not None:
-            template = self.cache.get(name)
-            if template is not None and (not self.auto_reload or (yield template.is_up_to_date)):
-                defer.returnValue(template)
-        template = yield self.loader.load(self, name, globals)
-        if self.cache is not None:
-            self.cache[name] = template
-        defer.returnValue(template)
+            waiting, result = self.cache.get(name, (False, None))
+
+            if not waiting:
+                result = self._load_cached_template(name, globals, result)
+                cached = self.cache[name] = [True, result]
+                result.addCallback(lambda res: setitem(cached, 0, False) or setitem(cached, 1, res) or res)
+
+            d = defer.Deferred()
+            result.addCallbacks(lambda res: d.callback(res) or res,
+                                lambda err: d.errback(err)  or err)
+            return d
+        return self.loader.load(self, name, globals)
 
     @internalcode
     def get_template(self, name, parent=None, globals=None):
