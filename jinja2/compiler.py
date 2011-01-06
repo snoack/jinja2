@@ -55,11 +55,11 @@ unoptimize_before_dead_code = bool(unoptimize_before_dead_code().func_closure)
 
 
 def generate(node, environment, name, filename, stream=None,
-             defer_init=False):
+             defer_init=False, twisted=False):
     """Generate the python source for a node tree."""
     if not isinstance(node, nodes.Template):
         raise TypeError('Can\'t compile non template nodes')
-    generator = CodeGenerator(environment, name, filename, stream, defer_init)
+    generator = CodeGenerator(environment, name, filename, stream, defer_init, twisted)
     generator.visit(node)
     if stream is None:
         return generator.stream.getvalue()
@@ -141,13 +141,12 @@ class Identifiers(object):
 
 class Function(object):
     """Holds metadata of the function generated for a frame."""
-    def __init__(self, name, args):
+    def __init__(self, name, args, returns_markup=False):
         self.name = name
         self.args = args
 
-        # functions that call other functions that return deferreds are using
-        # the inlineCallbacks decorator.
-        self.use_inline_callbacks = False
+        self.returns_markup = returns_markup
+        self.has_yield = False
 
 
 class Frame(object):
@@ -171,8 +170,10 @@ class Frame(object):
         # write tests around output statements.
         self.require_output_check = parent and parent.require_output_check
 
-        # this variable holds the name of the list used as buffer. The name of
-        # each buffer must be unique. So the codeGeneartor has to generate it.
+        # inside some tags or if using twisted we are using a buffer rather than
+        # yield statements. this for example affects {% filter %} or {% macro %}.
+        # If a frame is buffered this variable points to the name of the list
+        # used as buffer.
         self.buffer = None
 
         # the name of the block we're in, otherwise None.
@@ -384,7 +385,7 @@ class CompilerExit(Exception):
 class CodeGenerator(NodeVisitor):
 
     def __init__(self, environment, name, filename, stream=None,
-                 defer_init=False):
+                 defer_init=False, twisted=False):
         if stream is None:
             stream = StringIO()
         self.environment = environment
@@ -393,6 +394,7 @@ class CodeGenerator(NodeVisitor):
         self.stream = stream
         self.created_block_context = False
         self.defer_init = defer_init
+        self.twisted = twisted
 
         # aliases for imports
         self.import_aliases = {}
@@ -457,28 +459,34 @@ class CodeGenerator(NodeVisitor):
         self.writeline('def %s(%s):' % (frame.function.name, ', '.join(frame.function.args)), node)
         self.indent()
 
-    def leave_function(self, frame, safe=False):
-        """Return the buffer contents of the frame as deferred, leave
-        the function and apply the inlineCallbacks decorator if needed.
+    def leave_function(self, frame):
+        """Return the buffer contents of the frame if any, leave the function
+        and apply the inlineCallbacks decorator if needed.
         """
-        if frame.function.use_inline_callbacks:
-            return_stmt = 'defer.returnValue(%s)'
-        else:
-            return_stmt = 'return defer.succeed(%s)'
+        assert not (frame.buffer is None and (self.twisted or frame.function.returns_markup))
 
-        if not safe and frame.eval_ctx.volatile:
-            self.writeline('if context.eval_ctx.autoescape:')
-            self.indent()
-            self.writeline(return_stmt % 'Markup(concat(%s))' % frame.buffer)
-            self.outdent()
-            self.writeline(return_stmt % 'concat(%s)' % frame.buffer)
-        elif not safe and frame.eval_ctx.autoescape:
-            self.writeline(return_stmt % 'Markup(concat(%s))' % frame.buffer)
-        else:
-            self.writeline(return_stmt % 'concat(%s)' % frame.buffer)
+        if frame.buffer is not None:
+            if not self.twisted:
+                return_stmt = 'return %s'
+            elif frame.function.has_yield:
+                return_stmt = 'defer.returnValue(%s)'
+            else:
+                return_stmt = 'return defer.succeed(%s)'
 
+            if frame.function.returns_markup and frame.eval_ctx.volatile:
+                self.writeline('if context.eval_ctx.autoescape:')
+                self.indent()
+                self.writeline(return_stmt % 'Markup(concat(%s))' % frame.buffer)
+                self.outdent()
+                self.writeline(return_stmt % 'concat(%s)' % frame.buffer)
+            elif frame.function.returns_markup and frame.eval_ctx.autoescape:
+                self.writeline(return_stmt % 'Markup(concat(%s))' % frame.buffer)
+            else:
+                self.writeline(return_stmt % 'concat(%s)' % frame.buffer)
+        elif not frame.function.has_yield:
+            self.writeline('return iter([])')
         self.outdent()
-        if frame.function.use_inline_callbacks:
+        if self.twisted and frame.function.has_yield:
             self.writeline('%s = defer.inlineCallbacks(%s)' % (frame.function.name,
                                                                frame.function.name))
 
@@ -490,32 +498,31 @@ class CodeGenerator(NodeVisitor):
         """Outdent by step."""
         self._indentation -= step
 
-    def start_write(self, frame, node=None, param='single'):
-        """Start writing into the frame buffer."""
-        assert param in ('single', 'multiple', 'sequence')
-        assert not hasattr(frame, '_close_write')
-
-        frame._close_write = ')'
-        if param == 'single':
-            self.writeline(frame.buffer + '.append(', node)
+    def start_write(self, frame, node=None):
+        """Yield or write into the frame buffer."""
+        if frame.buffer is None:
+            self.writeline('yield ', node)
+            frame.function.has_yield = True
         else:
-            self.writeline(frame.buffer + '.extend(', node)
-            if param == 'multiple':
-                self.write('(')
-                frame._close_write += ')'
+            self.writeline('%s.append(' % frame.buffer, node)
 
     def end_write(self, frame):
         """End the writing process started by `start_write`."""
-        self.write(frame.__dict__.pop('_close_write'))
+        if frame.buffer is not None:
+            self.write(')')
 
     def start_deferred_call(self, frame):
-        """Start calling a function/attribute that returns a deferred result."""
-        self.write('(yield ')
-        frame.function.use_inline_callbacks = True
+        """Start calling a function/attribute that returns a deferred result if
+        using twisted.
+        """
+        if self.twisted:
+            self.write('(yield ')
+            self.function.has_yield = True
 
     def end_deferred_call(self):
         """End the calling process started by `start_deferred_call`."""
-        self.write(')')
+        if self.twisted:
+            self.write(')')
 
     def blockvisit(self, nodes, frame, need_statement=False):
         """Visit a list of nodes as block in a frame."""
@@ -692,7 +699,7 @@ class CodeGenerator(NodeVisitor):
         if children is None:
             children = node.iter_child_nodes()
         children = list(children)
-        func_frame = frame.inner(Function(name, args))
+        func_frame = frame.inner(Function(name, args, True))
         func_frame.inspect(children, hard_scope=True)
 
         # variables that are undeclared (accessed before declaration) and
@@ -798,7 +805,8 @@ class CodeGenerator(NodeVisitor):
 
         from jinja2.runtime import __all__ as exported
         self.writeline('from __future__ import division')
-        self.writeline('from twisted.internet import defer')
+        if self.twisted:
+            self.writeline('from twisted.internet import defer')
         self.writeline('from jinja2.runtime import ' + ', '.join(exported))
         if not unoptimize_before_dead_code:
             self.writeline('dummy = lambda *x: None')
@@ -841,7 +849,8 @@ class CodeGenerator(NodeVisitor):
         # generate the root render function.
         self.newline(extra=1)
         self.enter_function(frame)
-        self.buffer(frame)
+        if self.twisted:
+            self.buffer(frame)
 
         # process the root
         if have_extends:
@@ -866,7 +875,7 @@ class CodeGenerator(NodeVisitor):
             if not self.has_known_extends:
                 self.outdent()
 
-        self.leave_function(frame, safe=True)
+        self.leave_function(frame)
 
         # at this point we now have the blocks collected and can visit them too.
         for name, block in self.blocks.iteritems():
@@ -875,7 +884,8 @@ class CodeGenerator(NodeVisitor):
             block_frame.block = name
             self.newline(extra=1)
             self.enter_function(block_frame, block)
-            self.buffer(block_frame)
+            if self.twisted:
+                self.buffer(block_frame)
             undeclared = find_undeclared(block.body, ('self', 'super'))
             if 'self' in undeclared:
                 block_frame.identifiers.add_special('self')
@@ -887,7 +897,7 @@ class CodeGenerator(NodeVisitor):
             self.pull_locals(block_frame)
             self.pull_dependencies(block.body)
             self.blockvisit(block.body, block_frame)
-            self.leave_function(block_frame, safe=True)
+            self.leave_function(block_frame)
 
         self.writeline('blocks = {%s}' % ', '.join('%r: block_%s' % (x, x)
                                                    for x in self.blocks),
@@ -910,11 +920,22 @@ class CodeGenerator(NodeVisitor):
                 self.indent()
                 level += 1
 
-        self.start_write(frame, node)
-        self.start_deferred_call(frame)
-        self.write('context.blocks[%r][0](%s)' % (node.name, node.scoped and 'context.derived(locals())' or 'context'))
-        self.end_deferred_call()
-        self.end_write(frame)
+        context = node.scoped and 'context.derived(locals())' or 'context'
+        if twisted:
+            self.start_write(frame, node)
+            self.start_deferred_call(frame)
+            self.write('context.blocks[%r][0](%s)' % (node.name, context)
+            self.end_deferred_call()
+            self.end_write(frame)
+        else:
+            self.writeline('for event in context.blocks[%r][0](%s):' % (
+                           node.name, context), node)
+            self.indent()
+            level += 1
+            self.start_write(frame)
+            self.write('event')
+            self.end_write(frame)
+
         self.outdent(level)
 
     def visit_Extends(self, node, frame):
@@ -998,20 +1019,34 @@ class CodeGenerator(NodeVisitor):
             self.writeline('else:')
             self.indent()
 
-        if node.with_context:
-            self.start_write(frame)
-            self.start_deferred_call(frame)
-            self.write('template.root_render_func(template.new_context(context.parent, True, locals()))')
-            self.end_deferred_call()
-            self.end_write(frame)
+        if self.twisted:
+            if node.with_context:
+                self.start_write(frame)
+                self.start_deferred_call(frame)
+                self.write('template.root_render_func(template.new_context(context.parent, True, locals()))')
+                self.end_deferred_call()
+                self.end_write(frame)
+            else:
+                self.start_write(frame)
+                self.write('to_string(')
+                self.start_deferred_call(frame)
+                self.write('template.module')
+                self.end_deferred_call()
+                self.write(')')
+                self.end_write(frame)
         else:
+            if node.with_context:
+                self.writeline('for event in template.root_render_func('
+                               'template.new_context(context.parent, True, '
+                               'locals())):')
+            else:
+                self.writeline('for event in template.module._body_stream:')
+
+            self.indent()
             self.start_write(frame)
-            self.write('to_string(')
-            self.start_deferred_call(frame)
-            self.write('template.module')
-            self.end_deferred_call()
-            self.write(')')
+            self.write('event')
             self.end_write(frame)
+            self.outdent()
 
         if node.ignore_missing:
             self.outdent()
@@ -1315,35 +1350,81 @@ class CodeGenerator(NodeVisitor):
             else:
                 body.append([const])
 
-        if len(body) == 1:
-            self.start_write(frame, node, param='single')
+        if buffer is None:
+            frame.function.has_yield = True
+
+        # if we have less than 3 nodes or a buffer we yield or extend/append
+        if len(body) < 3 or frame.buffer is not None:
+            if frame.buffer is not None:
+                # for one item we append, for more we extend
+                if len(body) == 1:
+                    self.writeline('%s.append(' % frame.buffer)
+                else:
+                    self.writeline('%s.extend((' % frame.buffer)
+                self.indent()
+            for item in body:
+                if isinstance(item, list):
+                    val = repr(concat(item))
+                    if frame.buffer is None:
+                        self.writeline('yield ' + val)
+                    else:
+                        self.writeline(val + ', ')
+                else:
+                    if frame.buffer is None:
+                        self.writeline('yield ', item)
+                    else:
+                        self.newline(item)
+                    close = 1
+                    if frame.eval_ctx.volatile:
+                        self.write('(context.eval_ctx.autoescape and'
+                                   ' escape or to_string)(')
+                    elif frame.eval_ctx.autoescape:
+                        self.write('escape(')
+                    else:
+                        self.write('to_string(')
+                    if self.environment.finalize is not None:
+                        self.write('environment.finalize(')
+                        close += 1
+                    self.visit(item, frame)
+                    self.write(')' * close)
+                    if frame.buffer is not None:
+                        self.write(', ')
+            if frame.buffer is not None:
+                # close the open parentheses
+                self.outdent()
+                self.writeline(len(body) == 1 and ')' or '))')
+
+        # otherwise we create a format string as this is faster in that case
         else:
-            self.start_write(frame, node, param='multiple')
+            format = []
+            arguments = []
+            for item in body:
+                if isinstance(item, list):
+                    format.append(concat(item).replace('%', '%%'))
+                else:
+                    format.append('%s')
+                    arguments.append(item)
+            self.writeline('yield ')
+            self.write(repr(concat(format)) + ' % (')
+            idx = -1
             self.indent()
-        for item in body:
-            if len(body) > 1:
-                self.newline()
-            if isinstance(item, list):
-                self.write(repr(concat(item)))
-            else:
-                close = 1
+            for argument in arguments:
+                self.newline(argument)
+                close = 0
                 if frame.eval_ctx.volatile:
-                    self.write('(context.eval_ctx.autoescape and escape or to_string)(')
+                    self.write('(context.eval_ctx.autoescape and'
+                               ' escape or to_string)(')
+                    close += 1
                 elif frame.eval_ctx.autoescape:
                     self.write('escape(')
-                else:
-                    self.write('to_string(')
+                    close += 1
                 if self.environment.finalize is not None:
                     self.write('environment.finalize(')
                     close += 1
-                self.visit(item, frame)
-                self.write(')' * close)
-            if len(body) > 1:
-                self.write(',')
-        if len(body) > 1:
+                self.visit(argument, frame)
+                self.write(')' * close + ', ')
             self.outdent()
-            self.newline()
-        self.end_write(frame)
+            self.writeline(')')
 
         if outdent_later:
             self.outdent()

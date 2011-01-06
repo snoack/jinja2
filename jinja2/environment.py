@@ -442,7 +442,7 @@ class Environment(object):
 
         .. versionadded:: 2.5
         """
-        return generate(source, self, name, filename, defer_init=defer_init)
+        return generate(source, self, name, filename, defer_init=defer_init, twisted=True)
 
     def _compile(self, source, filename):
         """Internal hook that can be overriden to hook a different compile
